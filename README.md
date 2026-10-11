@@ -109,11 +109,12 @@ Se debe seleccionar exactamente una acción.
 | `--update-baseline` | Acepta explícitamente el inventario actual. |
 | `--check` | Compara el inventario actual con la baseline. |
 | `--list` | Muestra el inventario actual sin compararlo. |
-| `--history` | Muestra los eventos guardados. |
+| `--history` | Verifica y muestra los eventos guardados. |
 | `-r, --root <PATH>` | Define la raíz del sistema; por defecto `/`. |
 | `-S, --scope <user\|system\|all>` | Selecciona el alcance; por defecto `all`. |
 | `-o, --offline` | Usa únicamente evidencia de archivos. |
 | `-v, --verbose` | Muestra orígenes, hashes y razones de riesgo. |
+| `--hmac-key <ARCHIVO>` | Usa una clave HMAC privada de 32 bytes para Persist. |
 | `--history-days <DÍAS>` | Elimina segmentos de historial más antiguos; por defecto 90. |
 | `--history-max-mib <MIB>` | Limita el historial de cada perfil; por defecto 100 MiB. |
 
@@ -124,6 +125,14 @@ $XDG_STATE_HOME/sentinel/persist/<perfil>/
 ```
 
 Si `XDG_STATE_HOME` no está definido, se usa `~/.local/state`. Un escaneo incompleto no puede crear ni actualizar la baseline. Durante `--check`, los errores de cobertura se muestran y las eliminaciones de esas fuentes se suprimen.
+
+La baseline de Persist se autentica con HMAC-SHA256 y una clave independiente de FIM, guardada normalmente en:
+
+```text
+$XDG_CONFIG_HOME/sentinel/keys/persist-hmac.key
+```
+
+El historial usa registros HMAC encadenados: cada evento incluye su secuencia y el tag del evento anterior. Sentinel rechaza registros editados, eliminados o reordenados. Las baselines antiguas sin firma solo se migran mediante `--update-baseline`, que vuelve a recolectar el estado actual antes de firmarlo.
 
 Las etiquetas de `persist` son `ADDED`, `MODIFIED`, `REMOVED`, `ENABLED`, `DISABLED` y `RISK_CHANGED`.
 
@@ -396,11 +405,11 @@ Los enlaces simbólicos no se siguen. Se registra su destino. Los archivos espec
 | Componente | Responsabilidad |
 | --- | --- |
 | `scan_files`, `read_files`, `hash_files` | Descubrir entradas, leer metadatos y calcular hashes sin mezclar responsabilidades. |
-| `baseline`, `auth` | Guardar, firmar y verificar la baseline confiable de FIM. |
+| `baseline`, `auth` | Guardar, firmar y verificar documentos confiables con claves separadas para FIM y Persist. |
 | `monitor`, `event`, `runtime` | Comparar estados, construir eventos y coordinar watcher y reconciliación. |
 | `history`, `retention` | Escribir JSON Lines y aplicar límites de edad y espacio. |
 | `private_store` | Validar propietarios y permisos, abrir sin seguir symlinks y publicar archivos atómicamente. |
-| `persist` | Recolectar, normalizar y comparar mecanismos systemd, cron, SSH y XDG. |
+| `persist` | Recolectar, normalizar y comparar mecanismos systemd, cron, SSH y XDG; autenticar su baseline e historial. |
 
 El flujo de FIM es:
 
@@ -420,21 +429,26 @@ watcher + escaneo periódico
 El flujo de Persist es:
 
 ```text
-fuentes Linux → inventario normalizado → comparación con baseline
+fuentes Linux → inventario normalizado → baseline HMAC
                                            │
                                            ▼
-                              eventos + riesgo + código de salida
+                         eventos + historial HMAC encadenado
+                                           │
+                                           ▼
+                                  riesgo + código de salida
 ```
 
 ## Modelo de seguridad
 
 - Las baselines se crean únicamente mediante acciones explícitas.
-- La baseline de FIM usa HMAC-SHA256 y una clave privada separada.
+- Las baselines de FIM y Persist usan HMAC-SHA256 con claves y dominios separados.
+- El historial de Persist encadena registros autenticados para detectar edición, eliminación y reordenamiento dentro de la ventana retenida.
 - Los archivos de estado usan permisos privados y se rechazan symlinks y hard links inseguros.
 - Los archivos regulares se vuelven a calcular con SHA-256 durante la reconciliación.
 - Los symlinks se registran, pero no se siguen.
 - Un escaneo incompleto no sustituye el último estado completo ni crea una baseline nueva.
 - Persist suprime eliminaciones de fuentes cuya cobertura falló.
+- HMAC no cifra los datos y no protege frente a un proceso que pueda leer la clave. Restaurar conjuntamente una copia antigua de estado y clave requiere una fuente externa confiable para detectar rollback absoluto.
 
 ## Desarrollo
 
@@ -453,7 +467,7 @@ python3 -m unittest discover -s tests -v
 cargo clippy --offline --all-targets -- -D warnings
 ```
 
-La validación actual cubre 40 pruebas unitarias Rust, 58 pruebas ejecutables y una auditoría adversarial con HMAC alterado, permisos, hard links, cron duplicado, archivos especiales y cobertura incompleta.
+La validación incluye pruebas unitarias y ejecutables, además de auditorías adversariales sobre HMAC alterado, historial truncado, claves incorrectas, permisos, hard links, cron duplicado, archivos especiales y cobertura incompleta.
 
 ## Contribuir
 

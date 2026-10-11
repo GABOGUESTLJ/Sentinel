@@ -56,6 +56,7 @@ pub struct Options {
     pub scope: ScopeSelection,
     pub offline: bool,
     pub verbose: bool,
+    pub hmac_key: Option<PathBuf>,
     pub action: Action,
     pub history_policy: crate::retention::Policy,
 }
@@ -95,14 +96,18 @@ pub fn run(options: Options) -> Result<RunStatus, Error> {
     let paths = store::Paths::discover(&root, options.scope)?;
 
     if matches!(options.action, Action::History) {
-        let (events, warnings) = store::read_history(&paths.history, options.history_policy)?;
+        let key_path =
+            crate::auth::key_path_for(options.hmac_key.as_deref(), crate::auth::PERSIST_KEY_FILE)?;
+        let (events, warnings) = store::read_history(&paths, options.history_policy, &key_path)?;
         report::warnings(&warnings);
         report::history(&events, options.verbose);
         return Ok(RunStatus::Success);
     }
 
     if matches!(options.action, Action::UpdateBaseline) {
-        store::load_baseline(&paths.baseline, &root, options.scope)?;
+        let key_path =
+            crate::auth::key_path_for(options.hmac_key.as_deref(), crate::auth::PERSIST_KEY_FILE)?;
+        store::load_baseline_for_update(&paths.baseline, &root, options.scope, &key_path)?;
     }
 
     let snapshot = collect::collect(&collect::Options {
@@ -127,7 +132,18 @@ pub fn run(options: Options) -> Result<RunStatus, Error> {
                 .into());
             }
             let replace = matches!(options.action, Action::UpdateBaseline);
-            store::save_baseline(&paths.baseline, &root, options.scope, &snapshot, replace)?;
+            let key_path = crate::auth::ensure_key_for(
+                options.hmac_key.as_deref(),
+                crate::auth::PERSIST_KEY_FILE,
+            )?;
+            store::save_baseline(
+                &paths.baseline,
+                &root,
+                options.scope,
+                &snapshot,
+                &key_path,
+                replace,
+            )?;
             println!(
                 "Persist baseline saved at {} ({} mechanisms, scope={}).",
                 paths.baseline.display(),
@@ -136,9 +152,13 @@ pub fn run(options: Options) -> Result<RunStatus, Error> {
             );
         }
         Action::Check => {
-            let baseline = store::load_baseline(&paths.baseline, &root, options.scope)?;
+            let key_path = crate::auth::key_path_for(
+                options.hmac_key.as_deref(),
+                crate::auth::PERSIST_KEY_FILE,
+            )?;
+            let baseline = store::load_baseline(&paths.baseline, &root, options.scope, &key_path)?;
             let events = compare::compare(&baseline, &snapshot);
-            store::append_history(&paths.history, &events, options.history_policy)?;
+            store::append_history(&paths, &events, options.history_policy, &key_path)?;
             report::events(&events, options.verbose);
             let missing: Vec<_> = expected_coverage(options.scope)
                 .difference(&snapshot.coverage)

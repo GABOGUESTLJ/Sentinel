@@ -20,17 +20,17 @@ struct StoredFile {
     size: u64,
 }
 
-pub fn prune_jsonl(
+pub fn jsonl_to_prune(
     directory: &Path,
     policy: Policy,
     protected: Option<&Path>,
-) -> Result<usize, Error> {
+) -> Result<Vec<PathBuf>, Error> {
     if !directory.exists() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
     let now = SystemTime::now();
     let mut files = Vec::new();
-    let mut removed = 0;
+    let mut remove = Vec::new();
     for item in fs::read_dir(directory)? {
         let path = item?.path();
         if path
@@ -49,8 +49,7 @@ pub fn prune_jsonl(
             .duration_since(modified)
             .is_ok_and(|age| age > policy.max_age);
         if expired && !is_protected {
-            fs::remove_file(path)?;
-            removed += 1;
+            remove.push(path);
         } else {
             files.push(StoredFile {
                 path,
@@ -69,11 +68,22 @@ pub fn prune_jsonl(
         if protected.is_some_and(|protected| protected == file.path) {
             continue;
         }
-        fs::remove_file(&file.path)?;
+        remove.push(file.path);
         total = total.saturating_sub(file.size);
-        removed += 1;
     }
-    Ok(removed)
+    Ok(remove)
+}
+
+pub fn prune_jsonl(
+    directory: &Path,
+    policy: Policy,
+    protected: Option<&Path>,
+) -> Result<usize, Error> {
+    let remove = jsonl_to_prune(directory, policy, protected)?;
+    for path in &remove {
+        fs::remove_file(path)?;
+    }
+    Ok(remove.len())
 }
 
 pub fn rotated_path(path: &Path) -> PathBuf {

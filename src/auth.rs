@@ -9,6 +9,8 @@ use std::{
 type HmacSha256 = Hmac<Sha256>;
 type Error = Box<dyn std::error::Error>;
 const KEY_BYTES: usize = 32;
+pub const FIM_KEY_FILE: &str = "fim-hmac.key";
+pub const PERSIST_KEY_FILE: &str = "persist-hmac.key";
 
 pub struct Key([u8; KEY_BYTES]);
 
@@ -18,7 +20,10 @@ impl Drop for Key {
     }
 }
 
-pub fn key_path(override_path: Option<&Path>) -> Result<PathBuf, Error> {
+pub fn key_path_for(
+    override_path: Option<&Path>,
+    default_file_name: &str,
+) -> Result<PathBuf, Error> {
     if let Some(path) = override_path {
         if !path.is_absolute() {
             return Err("--hmac-key must be an absolute path".into());
@@ -27,11 +32,14 @@ pub fn key_path(override_path: Option<&Path>) -> Result<PathBuf, Error> {
     }
     Ok(crate::private_store::config_home()?
         .join("sentinel/keys")
-        .join("fim-hmac.key"))
+        .join(default_file_name))
 }
 
-pub fn ensure_key(override_path: Option<&Path>) -> Result<PathBuf, Error> {
-    let path = key_path(override_path)?;
+pub fn ensure_key_for(
+    override_path: Option<&Path>,
+    default_file_name: &str,
+) -> Result<PathBuf, Error> {
+    let path = key_path_for(override_path, default_file_name)?;
     let parent = path.parent().ok_or("HMAC key path has no parent")?;
     crate::private_store::ensure_private_directory(parent, true, "HMAC key")?;
     if path.exists() {
@@ -52,6 +60,14 @@ pub fn ensure_key(override_path: Option<&Path>) -> Result<PathBuf, Error> {
     }
     bytes.fill(0);
     Ok(path)
+}
+
+pub fn key_path(override_path: Option<&Path>) -> Result<PathBuf, Error> {
+    key_path_for(override_path, FIM_KEY_FILE)
+}
+
+pub fn ensure_key(override_path: Option<&Path>) -> Result<PathBuf, Error> {
+    ensure_key_for(override_path, FIM_KEY_FILE)
 }
 
 pub fn load(path: &Path) -> Result<Key, Error> {
@@ -89,7 +105,7 @@ pub fn verify(key: &Key, domain: &[u8], payload: &[u8], tag: &[u8]) -> Result<()
     mac.update(domain);
     mac.update(payload);
     mac.verify_slice(tag)
-        .map_err(|_| "HMAC verification failed; the baseline or key was changed".into())
+        .map_err(|_| "HMAC verification failed; authenticated data or key was changed".into())
 }
 
 #[cfg(test)]
@@ -102,6 +118,7 @@ mod tests {
         let second = Key([2; KEY_BYTES]);
         let tag = sign(&first, b"domain", b"payload");
         assert!(verify(&first, b"domain", b"payload", &tag).is_ok());
+        assert!(verify(&first, b"other-domain", b"payload", &tag).is_err());
         assert!(verify(&first, b"domain", b"changed", &tag).is_err());
         assert!(verify(&second, b"domain", b"payload", &tag).is_err());
     }
