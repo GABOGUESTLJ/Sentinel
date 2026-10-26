@@ -99,15 +99,36 @@ impl Paths {
     }
 
     fn under(state_home: &Path, root: &Path, scope: ScopeSelection) -> Result<Self, Error> {
+        let paths = Self::located_under(state_home, root, scope);
+        private_store::ensure_private_directory(
+            paths.history.parent().unwrap(),
+            true,
+            "persist state",
+        )?;
+        Ok(paths)
+    }
+
+    pub fn read_only(root: &Path, scope: ScopeSelection) -> Result<Self, Error> {
+        let paths = Self::located_under(&private_store::state_home()?, root, scope);
+        let directory = paths
+            .history
+            .parent()
+            .ok_or("Persist history has no directory")?;
+        if directory.try_exists()? {
+            private_store::ensure_private_directory(directory, false, "persist state")?;
+        }
+        Ok(paths)
+    }
+
+    fn located_under(state_home: &Path, root: &Path, scope: ScopeSelection) -> Self {
         let profile = profile_key(root, scope);
         let directory = state_home.join("sentinel/persist").join(&profile);
-        private_store::ensure_private_directory(&directory, true, "persist state")?;
-        Ok(Self {
+        Self {
             baseline: directory.join("baseline.json"),
             history: directory.join("history.jsonl"),
             history_state: directory.join("history-state.json"),
             profile,
-        })
+        }
     }
 }
 
@@ -339,6 +360,14 @@ fn verify_chain(
     paths: &Paths,
     key: &auth::Key,
 ) -> Result<(HistoryState, Vec<VerifiedRecord>), Error> {
+    verify_chain_mode(paths, key, true)
+}
+
+fn verify_chain_mode(
+    paths: &Paths,
+    key: &auth::Key,
+    repair: bool,
+) -> Result<(HistoryState, Vec<VerifiedRecord>), Error> {
     let records = read_records(paths, key)?;
     let Some(mut state) = load_history_state(paths, key)? else {
         if records.is_empty() {
@@ -384,7 +413,9 @@ fn verify_chain(
     if tail.payload.sequence > state.last_sequence {
         state.last_sequence = tail.payload.sequence;
         state.last_tag_hex = tail.tag_hex.clone();
-        save_history_state(&paths.history_state, &state, key, true)?;
+        if repair {
+            save_history_state(&paths.history_state, &state, key, true)?;
+        }
     }
     Ok((state, records))
 }
@@ -501,6 +532,25 @@ pub fn read_history(
         .map(|record| record.payload.event)
         .collect();
     Ok((events, Vec::new()))
+}
+
+/// Verify all retained evidence without retention or authenticated-state repair.
+pub fn read_history_only(paths: &Paths, key_path: &Path) -> Result<Vec<PersistEvent>, Error> {
+    if !paths
+        .history
+        .parent()
+        .ok_or("Persist history has no directory")?
+        .try_exists()?
+    {
+        return Ok(Vec::new());
+    }
+    let key = auth::load(key_path)?;
+    let (state, records) = verify_chain_mode(paths, &key, false)?;
+    Ok(records
+        .into_iter()
+        .filter(|record| record.payload.sequence >= state.first_sequence)
+        .map(|record| record.payload.event)
+        .collect())
 }
 
 #[cfg(test)]

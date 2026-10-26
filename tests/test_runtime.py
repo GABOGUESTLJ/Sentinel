@@ -19,7 +19,7 @@ BINARY = Path(__file__).resolve().parents[1] / "target/debug/sentinel"
 class Monitor:
     def __init__(self, path, cwd=None, args=(), env=None):
         self.process = subprocess.Popen(
-            [str(BINARY), "fim", "--scan", str(path), *args], cwd=cwd, env=env,
+            [str(BINARY), "fim", "--output", "legacy", "--scan", str(path), *args], cwd=cwd, env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         self.events = queue.Queue()
@@ -90,6 +90,7 @@ class RuntimeTests(unittest.TestCase):
         self.env = dict(
             os.environ,
             TMPDIR=str(self.state),
+            SENTINEL_STATE_DIR=str(self.base / "durable-state"),
             XDG_STATE_HOME=str(self.base / "xdg-state"),
             XDG_CONFIG_HOME=str(self.base / "xdg-config"),
         )
@@ -328,7 +329,7 @@ class RuntimeTests(unittest.TestCase):
         master, slave = pty.openpty()
         self.addCleanup(os.close, master)
         try:
-            process = subprocess.Popen([str(BINARY), "fim", "-s", str(self.root)],
+            process = subprocess.Popen([str(BINARY), "fim", "--output", "legacy", "-s", str(self.root)],
                                        stdin=slave, stdout=slave, stderr=slave, env=self.env)
         finally:
             os.close(slave)

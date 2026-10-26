@@ -1,5 +1,5 @@
 use super::{
-    collect::{Options, display_origin, read_text, regular_files, rooted},
+    collect::{Options, display_origin, path_exists, read_text, regular_files, rooted},
     model::{CollectorOutput, EntrySpec, Evidence, PersistenceEntry, Scope, Source},
 };
 use std::{
@@ -80,7 +80,9 @@ fn collect_file(
     owner: &str,
     system_format: bool,
 ) -> Result<(), String> {
-    if !path.exists() {
+    let exists = path_exists(path)?;
+    output.inspected(Source::Cron, scope, owner, path);
+    if !exists {
         return Ok(());
     }
     let text = read_text(path)?;
@@ -105,7 +107,9 @@ fn collect_periodic(
     directory: &Path,
     trigger: &str,
 ) -> Result<(), String> {
-    for path in regular_files(directory)? {
+    let files = regular_files(directory)?;
+    output.inspected(Source::Cron, Scope::System, "root", directory);
+    for path in files {
         let origin = display_origin(root, &path);
         let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
         output.entries.push(PersistenceEntry::new(EntrySpec {
@@ -171,6 +175,7 @@ pub fn collect(options: &Options) -> CollectorOutput {
         output.covered(Source::Cron, Scope::User);
         for spool in ["/var/spool/cron", "/var/spool/cron/crontabs"] {
             let directory = rooted(&options.root, spool);
+            output.inspected(Source::Cron, Scope::User, "spool", &directory);
             match regular_files(&directory) {
                 Ok(files) => {
                     for path in files {

@@ -213,15 +213,36 @@ pub struct CollectorOutput {
     pub entries: Vec<PersistenceEntry>,
     pub coverage: BTreeSet<Coverage>,
     pub warnings: Vec<String>,
+    failed: BTreeSet<Coverage>,
 }
 
 impl CollectorOutput {
     pub fn covered(&mut self, source: Source, scope: Scope) {
-        self.coverage.insert(Coverage { source, scope });
+        let coverage = Coverage { source, scope };
+        if !self.failed.contains(&coverage) {
+            self.coverage.insert(coverage);
+        }
     }
 
     pub fn fail(&mut self, source: Source, scope: Scope, message: impl Into<String>) {
-        self.coverage.remove(&Coverage { source, scope });
-        self.warnings.push(message.into());
+        let coverage = Coverage { source, scope };
+        self.coverage.remove(&coverage);
+        self.failed.insert(coverage);
+        self.warnings.push(format!(
+            "source={} scope={}: {}",
+            source.label(),
+            scope.label(),
+            message.into()
+        ));
+    }
+
+    pub fn inspected(&mut self, source: Source, scope: Scope, owner: &str, path: &std::path::Path) {
+        // Transient report evidence only; never part of the authenticated schema.
+        self.warnings.push(format!(
+            "COVERAGE source={} scope={} owner={owner:?} status=inspected path={:?}",
+            source.label(),
+            scope.label(),
+            path.to_string_lossy()
+        ));
     }
 }

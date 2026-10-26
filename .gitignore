@@ -1,4 +1,12 @@
 /target
+/learning/
 __pycache__/
 .agents/
 .engram/
+.engram-new-backup/
+.atl/
+/AGENTS.md
+/pdr.md
+/Sentinel_Trace_PRD_v0.3.md
+/odd/
+/docs/system_architecture.md

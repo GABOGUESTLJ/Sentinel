@@ -11,7 +11,7 @@ mod xdg;
 use clap::ValueEnum;
 use model::{Coverage, Risk, Scope, Source};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::PathBuf};
+use std::{collections::BTreeSet, os::unix::ffi::OsStrExt, path::PathBuf};
 
 type Error = Box<dyn std::error::Error>;
 
@@ -56,9 +56,11 @@ pub struct Options {
     pub scope: ScopeSelection,
     pub offline: bool,
     pub verbose: bool,
+    pub output: crate::presentation::Options,
     pub hmac_key: Option<PathBuf>,
     pub action: Action,
     pub history_policy: crate::retention::Policy,
+    pub export: Option<crate::history_export::Request>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,14 +95,62 @@ pub fn run(options: Options) -> Result<RunStatus, Error> {
     if !std::fs::symlink_metadata(&root)?.is_dir() {
         return Err(format!("Not a directory: {}", root.display()).into());
     }
-    let paths = store::Paths::discover(&root, options.scope)?;
+    let paths = if options.export.is_some() {
+        store::Paths::read_only(&root, options.scope)?
+    } else {
+        store::Paths::discover(&root, options.scope)?
+    };
 
     if matches!(options.action, Action::History) {
         let key_path =
             crate::auth::key_path_for(options.hmac_key.as_deref(), crate::auth::PERSIST_KEY_FILE)?;
+        if let Some(export) = options.export {
+            let events = store::read_history_only(&paths, &key_path)?;
+            let count = export.write(
+                "persist",
+                &events,
+                paths
+                    .history
+                    .parent()
+                    .ok_or("Persist history has no directory")?,
+            )?;
+            let message = format!(
+                "History exported: {} to {}",
+                if count == 1 {
+                    "1 event".to_owned()
+                } else {
+                    format!("{count} events")
+                },
+                crate::presentation::path(&export.destination)
+            );
+            let legacy = format!(
+                "History exported: {count} event(s) to {}",
+                export
+                    .destination
+                    .to_str()
+                    .map(crate::presentation::safe)
+                    .unwrap_or_else(|| crate::presentation::path(&export.destination))
+            );
+            options.output.message(
+                "persist",
+                "export",
+                &message,
+                &legacy,
+                &serde_json::json!({"count":count,"destination":export.destination.to_str(),
+                    "destination_bytes":hex::encode(export.destination.as_os_str().as_bytes())}),
+            )?;
+            return Ok(RunStatus::Success);
+        }
         let (events, warnings) = store::read_history(&paths, options.history_policy, &key_path)?;
-        report::warnings(&warnings);
-        report::history(&events, options.verbose);
+        report::warnings(&warnings, options.verbose, false, &options.output)?;
+        report::events(
+            &root,
+            options.scope,
+            &events,
+            options.verbose,
+            &options.output,
+            true,
+        )?;
         return Ok(RunStatus::Success);
     }
 
@@ -115,10 +165,24 @@ pub fn run(options: Options) -> Result<RunStatus, Error> {
         scope: options.scope,
         offline: options.offline || root != std::path::Path::new("/"),
     });
-    report::warnings(&snapshot.warnings);
+    // Human list prints incomplete coverage after the findings section.
+    report::warnings(
+        &snapshot.warnings,
+        options.verbose,
+        matches!(options.action, Action::List),
+        &options.output,
+    )?;
 
     match options.action {
-        Action::List => report::inventory(&snapshot, options.verbose),
+        Action::List => {
+            report::inventory(
+                &root,
+                &snapshot,
+                options.scope,
+                options.verbose,
+                &options.output,
+            )?;
+        }
         Action::InitBaseline | Action::UpdateBaseline => {
             let missing: Vec<_> = expected_coverage(options.scope)
                 .difference(&snapshot.coverage)
@@ -144,12 +208,33 @@ pub fn run(options: Options) -> Result<RunStatus, Error> {
                 &key_path,
                 replace,
             )?;
-            println!(
-                "Persist baseline saved at {} ({} mechanisms, scope={}).",
-                paths.baseline.display(),
-                snapshot.entries.len(),
-                options.scope.label()
-            );
+            let location = crate::presentation::path(&paths.baseline);
+            let legacy_location = paths
+                .baseline
+                .to_str()
+                .map(crate::presentation::safe)
+                .unwrap_or_else(|| location.clone());
+            let verb = if replace { "updated" } else { "created" };
+            let count = if snapshot.entries.len() == 1 {
+                "1 mechanism".to_owned()
+            } else {
+                format!("{} mechanisms", snapshot.entries.len())
+            };
+            let scope = match options.scope {
+                ScopeSelection::User => "user",
+                ScopeSelection::System => "system",
+                ScopeSelection::All => "user + system",
+            };
+            let confirmation = if options.verbose {
+                format!("SENTINEL / PERSIST\nBaseline {verb}: {location} ({count} · scope: {scope}).")
+            } else {
+                format!("SENTINEL / PERSIST\nBaseline {verb} · {count} · scope: {scope}.")
+            };
+            options.output.message("persist", "baseline",
+                &confirmation,
+                &format!("Persist baseline saved at {legacy_location} ({} mechanisms, scope={}).", snapshot.entries.len(), options.scope.label()),
+                &serde_json::json!({"action":if replace {"update"} else {"init"},"path":paths.baseline.to_str(),
+                    "path_bytes":hex::encode(paths.baseline.as_os_str().as_bytes()),"total":snapshot.entries.len(),"scope":options.scope,"observed_at":snapshot.observed_at}))?;
         }
         Action::Check => {
             let key_path = crate::auth::key_path_for(
@@ -159,16 +244,28 @@ pub fn run(options: Options) -> Result<RunStatus, Error> {
             let baseline = store::load_baseline(&paths.baseline, &root, options.scope, &key_path)?;
             let events = compare::compare(&baseline, &snapshot);
             store::append_history(&paths, &events, options.history_policy, &key_path)?;
-            report::events(&events, options.verbose);
+            report::events(
+                &root,
+                options.scope,
+                &events,
+                options.verbose,
+                &options.output,
+                false,
+            )?;
+            report::check_summary(&snapshot, options.scope, &options.output)?;
             let missing: Vec<_> = expected_coverage(options.scope)
                 .difference(&snapshot.coverage)
                 .map(|coverage| format!("{}:{}", coverage.source.label(), coverage.scope.label()))
                 .collect();
             if !missing.is_empty() {
-                eprintln!(
-                    "Audit incomplete; removals from uncovered sources were suppressed: {}",
-                    missing.join(", ")
-                );
+                options.output.diagnostic(
+                    "persist",
+                    "warning",
+                    &format!(
+                        "Audit incomplete; removals from uncovered sources were suppressed: {}",
+                        missing.join(", ")
+                    ),
+                )?;
                 return Ok(RunStatus::Incomplete);
             }
             if events.iter().any(|event| {

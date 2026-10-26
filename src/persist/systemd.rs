@@ -1,5 +1,5 @@
 use super::{
-    collect::{Options, display_origin, read_text, rooted, user_homes},
+    collect::{Options, display_origin, path_exists, read_text, rooted, user_homes},
     model::{CollectorOutput, EntrySpec, Evidence, PersistenceEntry, Scope, Source},
 };
 use std::{
@@ -92,7 +92,7 @@ fn user_directories(root: &Path, home: &Path) -> Vec<PathBuf> {
 fn unit_files(directories: &[PathBuf]) -> Result<BTreeMap<String, PathBuf>, String> {
     let mut units = BTreeMap::new();
     for directory in directories {
-        if !directory.exists() {
+        if !path_exists(directory)? {
             continue;
         }
         let items = std::fs::read_dir(directory)
@@ -108,29 +108,33 @@ fn unit_files(directories: &[PathBuf]) -> Result<BTreeMap<String, PathBuf>, Stri
     Ok(units)
 }
 
-fn statically_enabled(directories: &[PathBuf], unit: &str) -> bool {
-    directories.iter().any(|directory| {
-        if !directory.exists() {
-            return false;
+fn statically_enabled(directories: &[PathBuf], unit: &str) -> Result<bool, String> {
+    let mut enabled = false;
+    for directory in directories {
+        if !path_exists(directory)? {
+            continue;
         }
-        WalkDir::new(directory)
+        for item in WalkDir::new(directory)
             .min_depth(2)
             .max_depth(2)
             .follow_links(false)
-            .into_iter()
-            .flatten()
-            .any(|item| {
-                item.file_name() == unit
-                    && item
-                        .path()
-                        .parent()
-                        .and_then(Path::file_name)
-                        .is_some_and(|name| {
-                            let name = name.to_string_lossy();
-                            name.ends_with(".wants") || name.ends_with(".requires")
-                        })
-            })
-    })
+        {
+            let item = item.map_err(|error| format!("{}: {error}", directory.display()))?;
+            if item.file_name() == unit
+                && item
+                    .path()
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| {
+                        let name = name.to_string_lossy();
+                        name.ends_with(".wants") || name.ends_with(".requires")
+                    })
+            {
+                enabled = true;
+            }
+        }
+    }
+    Ok(enabled)
 }
 
 fn parse_unit(
@@ -146,7 +150,7 @@ fn parse_unit(
     let mut dropins = Vec::new();
     for directory in directories.iter().rev() {
         let path = directory.join(format!("{unit}.d"));
-        if !path.exists() {
+        if !path_exists(&path)? {
             continue;
         }
         let mut directory_dropins = Vec::new();
@@ -227,7 +231,7 @@ fn parse_unit(
         }
     }
 
-    let inferred_enabled = statically_enabled(directories, unit);
+    let inferred_enabled = statically_enabled(directories, unit)?;
     let runtime_values = runtime.and_then(|state| state.units.get(unit).copied());
     let enabled = runtime_values
         .and_then(|value| value.0)
@@ -289,6 +293,9 @@ fn collect_scope(
     output.covered(Source::Systemd, scope);
     match unit_files(&directories) {
         Ok(units) => {
+            for directory in &directories {
+                output.inspected(Source::Systemd, scope, owner, directory);
+            }
             for (unit, path) in units {
                 match parse_unit(
                     &options.root,
@@ -338,7 +345,7 @@ pub fn collect(options: &Options) -> CollectorOutput {
                 runtime_warnings.insert(error);
                 None
             });
-        let homes = user_homes(&options.root);
+        let homes = user_homes(&options.root, &mut output, Source::Systemd);
         if homes.is_empty() {
             output.covered(Source::Systemd, Scope::User);
         }

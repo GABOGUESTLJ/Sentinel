@@ -69,6 +69,29 @@ sentinel persist --help
 
 ## Auditoría de persistencia
 
+### Modos de salida
+
+La salida predeterminada es `human`: resumen por fuente y por riesgo, hallazgos
+HIGH y MEDIUM con su estado y motivo, y detalles técnicos disponibles mediante
+`--verbose`. Para automatización, usa `--output json` (JSON Lines versionado);
+para migrar scripts que analizan el texto anterior, usa temporalmente
+`--output legacy`.
+
+```bash
+sentinel fim --scan ~/sentinel-prueba --verbose
+sentinel persist --scope system --offline --list
+sentinel persist --scope system --offline --check --output json
+sentinel persist --scope system --history --output legacy
+```
+
+Los colores se desactivan al redirigir la salida y respetan `NO_COLOR` y
+`--no-color`. Los indicadores y etiquetas siguen siendo comprensibles sin color.
+`LOW` no significa que una entrada sea segura: revisa también evidencia y cobertura.
+
+`--output` no cambia los códigos de salida, la detección ni los formatos guardados.
+`--format` conserva su función de seleccionar Markdown/Text al exportar historial.
+Consulta el [contrato de consola y guía de migración](docs/cli-output.md).
+
 `persist` analiza servicios y timers de systemd, cron, claves SSH autorizadas y entradas de inicio automático XDG. No ejecuta ni modifica los comandos encontrados.
 
 En la raíz activa `/`, usa D-Bus para enriquecer systemd con su estado efectivo y archivos para conservar la evidencia de configuración. `--offline` desactiva D-Bus. Una raíz alternativa siempre se trata como una imagen estática, para no mezclarla con el estado del host.
@@ -93,6 +116,13 @@ sentinel persist --scope system --update-baseline
 sentinel persist --scope all --history
 ```
 
+`--list` aplica divulgación progresiva: cuenta todas las entradas, muestra solo
+hallazgos HIGH y MEDIUM (hasta 40, con aviso explícito de cuántos quedan) e indica
+usar `--verbose` para el inventario completo. Nada se descarta: `--verbose` y
+`--output json` conservan todas las entradas. En systemd, `Status` refleja la
+habilitación y `Active` la actividad observada; `unknown` significa que la
+auditoría no la observó, y una unidad deshabilitada no implica que esté inactiva.
+
 Para analizar una imagen montada o una sandbox:
 
 ```bash
@@ -114,8 +144,10 @@ Se debe seleccionar exactamente una acción.
 | `-S, --scope <user\|system\|all>` | Selecciona el alcance; por defecto `all`. |
 | `-o, --offline` | Usa únicamente evidencia de archivos. |
 | `-v, --verbose` | Muestra orígenes, hashes y razones de riesgo. |
+| `--output <human\|json\|legacy>` | Selecciona el formato de consola; por defecto `human`. |
+| `--no-color` | Desactiva colores, incluso en una terminal. |
 | `--hmac-key <ARCHIVO>` | Usa una clave HMAC privada de 32 bytes para Persist. |
-| `--history-days <DÍAS>` | Elimina segmentos de historial más antiguos; por defecto 90. |
+| `--history-days <DÍAS>` | Elimina segmentos de historial más antiguos; por defecto 14. |
 | `--history-max-mib <MIB>` | Limita el historial de cada perfil; por defecto 100 MiB. |
 
 La baseline y el historial se guardan bajo:
@@ -125,6 +157,8 @@ $XDG_STATE_HOME/sentinel/persist/<perfil>/
 ```
 
 Si `XDG_STATE_HOME` no está definido, se usa `~/.local/state`. Un escaneo incompleto no puede crear ni actualizar la baseline. Durante `--check`, los errores de cobertura se muestran y las eliminaciones de esas fuentes se suprimen.
+
+La información de cobertura (líneas `COVERAGE` en modo `legacy`) indica la población considerada, los usuarios y rutas inspeccionados, los scopes omitidos y si cada fuente quedó completa o incompleta. `all` combina scopes de usuario y sistema: **no significa todas las cuentas del host**. En la raíz activa se consideran `$HOME` y `$USER`; en una raíz alternativa, los hogares inmediatos de `/home` y `/root`. Cron inspecciona además los spools previstos. No hay descubrimiento NSS de todas las cuentas. Los errores de enumeración o acceso no se interpretan como ausencia de mecanismos; un fallo previo no se borra por inspeccionar correctamente otro hogar.
 
 La baseline de Persist se autentica con HMAC-SHA256 y una clave independiente de FIM, guardada normalmente en:
 
@@ -201,17 +235,35 @@ Conserva una copia segura de la clave. Perderla impide verificar la baseline. HM
 La baseline se guarda fuera del árbol vigilado, normalmente en:
 
 ```text
-/tmp/fim-baselines-<uid>/<hash-de-la-ruta>.json
+/var/lib/sentinel/<uid>/fim/baselines/<hash-de-la-ruta>.json
 ```
 
-Sentinel respeta `TMPDIR`. Si el directorio temporal está dentro de la carpeta vigilada, configura una ubicación externa:
+La ubicación predeterminada requiere una preparación administrativa **separada**. Un administrador puede crear el directorio del usuario con estos comandos, después de revisar el UID y GID de destino; no ejecutes el monitor completo como root solo para guardar la baseline:
 
 ```bash
-TMPDIR=/var/tmp sentinel fim --scan ~/sentinel-prueba --init-baseline
-TMPDIR=/var/tmp sentinel fim --scan ~/sentinel-prueba
+sudo install -d -m 0755 /var/lib/sentinel
+sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "/var/lib/sentinel/$(id -u)"
 ```
 
-El directorio de la baseline usa permisos `0700` y el archivo usa `0600`. El almacenamiento temporal puede ser limpiado por el sistema operativo.
+Como alternativa sin privilegios, configura una ubicación durable absoluta y fuera del árbol vigilado. `SENTINEL_STATE_DIR` sustituye la raíz por usuario, no cambia la ubicación de las claves ni del historial:
+
+```bash
+export SENTINEL_STATE_DIR="$HOME/.local/state/sentinel-baselines"
+sentinel fim --scan ~/sentinel-prueba --init-baseline
+sentinel fim --scan ~/sentinel-prueba
+```
+
+Los directorios privados de baseline usan `0700` y sus archivos `0600`. Sentinel rechaza ubicaciones inseguras y no vuelve a `/tmp` si falla el destino durable. No hay vencimiento automático de baselines ni claves. Mover el almacenamiento no cambia la frecuencia de reconciliación ni convierte cambios nuevos en confiables.
+
+### Migrar una baseline FIM existente
+
+Si aún conservas la baseline firmada anterior, su clave y el mismo `TMPDIR` utilizado antes, puedes migrarla explícitamente:
+
+```bash
+TMPDIR=/ruta/temporal/anterior sentinel fim --scan ~/sentinel-prueba --migrate-baseline
+```
+
+La migración verifica HMAC, raíz y permisos antes de publicar los mismos bytes en el destino durable; conserva la baseline original y la clave y rechaza sobrescribir un destino existente. No admite una baseline sin firma ni toma un escaneo nuevo como referencia. Si la referencia temporal ya se perdió, no se puede recuperar mediante migración: debes investigar y aceptar una baseline nueva explícitamente. Conserva copias seguras de baseline y clave.
 
 ### Escaneo y reconciliación
 
@@ -315,7 +367,30 @@ Si `XDG_STATE_HOME` no está definido, usa:
 ~/.local/state/sentinel/fim/<hash-de-la-raiz>/history/
 ```
 
-El directorio debe estar fuera de la carpeta vigilada. Si no lo está, define `XDG_STATE_HOME` con una ruta externa. Por defecto se eliminan segmentos con más de 90 días y se conservan hasta 100 MiB por perfil. Puedes ajustar ambos límites con `--history-days` y `--history-max-mib`. El segmento que se está escribiendo se conserva aunque un solo lote supere el límite.
+El directorio debe estar fuera de la carpeta vigilada. Si no lo está, define `XDG_STATE_HOME` con una ruta externa. Por defecto se eliminan segmentos con más de **14 días** y se conservan hasta 100 MiB por perfil. Puedes ajustar ambos límites con `--history-days` y `--history-max-mib`. La edad se calcula por la modificación del segmento, no por el vencimiento individual de cada evento; el segmento activo se protege aunque un lote supere el límite. El tamaño puede reducir la ventana efectiva de días disponibles.
+
+La retención se aplica durante escrituras y consultas ordinarias, no mediante un servicio que elimine archivos mientras Sentinel está apagado. No afecta a baselines ni claves. El historial FIM continúa siendo JSONL sin HMAC; el de Persist conserva su cadena autenticada.
+
+Si no se puede escribir el historial FIM, se reintenta con una cola limitada a **4096 eventos y 16 MiB serializados**. Si un fallo persistente agotaría cualquiera de esos límites, Sentinel termina con código `1` y un error explícito en lugar de descartar eventos silenciosamente o acumular memoria sin límite. Esto no garantiza conservar eventos pendientes tras un cierre o fallo del proceso.
+
+### Exportar historial a Markdown o texto
+
+Ambas herramientas permiten exportar los registros que todavía existen en disco:
+
+```bash
+sentinel fim --scan ~/sentinel-prueba --history --export ./historial.md
+sentinel fim --scan ~/sentinel-prueba --history=archivo.txt --export ./historial.txt --format text
+sentinel persist --scope all --history --export ./persistencia.md --format markdown
+sentinel persist --scope all --history --export ./enero.txt --format text --since 2026-01-01 --until 2026-01-31
+```
+
+Las fechas son días UTC en formato `YYYY-MM-DD`, incluidos ambos extremos. `--format`, `--since` y `--until` requieren `--export`, y exportar requiere `--history`. Por defecto el formato es Markdown; la extensión no elige el formato. Un rango vacío produce un informe de cero eventos.
+
+Combinar opciones de exportación con inicialización, actualización, migración, inventario o comprobación se rechaza con código `2` antes de acceder al almacenamiento. Ninguna opción explícita de exportación se ignora para ejecutar otra acción.
+
+La exportación no poda segmentos, no repara el estado del historial y no crea claves o baselines. Persist verifica la cadena HMAC antes de exportar; FIM rechaza exportar un historial con registros inválidos. Los filtros de retención no se aplican a esta lectura: puedes exportar segmentos aún presentes antes de su próxima limpieza. No se recuperan registros ya eliminados.
+
+El archivo de salida se crea privado (`0600`), nunca sobrescribe un destino existente y debe estar fuera del directorio del historial de origen. Incluye los campos estructurados de evidencia en bloques legibles, con rutas reversibles y caracteres de control escapados. Es un informe derivado, **no un archivo autenticado ni una copia verificable de la cadena original**. Los informes exportados no vencen automáticamente; tú administras su retención y privacidad.
 
 ## Controlar la salida durante la ejecución
 
@@ -368,11 +443,15 @@ sentinel fim --scan ~/sentinel-prueba -hs -i 5
 | `-d, --desilent` | Habilita la salida al iniciar o desde la terminal activa. |
 | `--init-baseline` | Crea la primera baseline y termina. |
 | `--update-baseline` | Sustituye explícitamente la baseline con el estado actual y termina. |
+| `--migrate-baseline` | Copia una baseline legacy firmada al almacenamiento durable, sin borrar el origen. |
 | `--hmac-key <ARCHIVO>` | Usa una clave HMAC privada de 32 bytes en una ruta absoluta. |
 | `--history` | Muestra el historial completo de la raíz y termina. |
 | `--history=<ARCHIVO>` | Muestra el historial relacionado con un archivo y termina. |
-| `--history-days <DÍAS>` | Retención temporal del historial; por defecto 90 días. |
+| `--history-days <DÍAS>` | Retención temporal del historial; por defecto 14 días. |
 | `--history-max-mib <MIB>` | Límite de historial por perfil; por defecto 100 MiB. |
+| `--export <ARCHIVO>` | Exporta el historial disponible sin modificarlo; requiere `--history`. |
+| `--format <markdown\|text>` | Formato de exportación; por defecto Markdown. |
+| `--since`, `--until <YYYY-MM-DD>` | Filtros inclusivos por día UTC para la exportación. |
 
 `-hs` se convierte internamente en `--hardscan` porque las opciones cortas de Clap tienen un solo carácter. La opción antigua `--path` fue reemplazada por `--scan`.
 
@@ -406,8 +485,11 @@ Los enlaces simbólicos no se siguen. Se registra su destino. Los archivos espec
 | --- | --- |
 | `scan_files`, `read_files`, `hash_files` | Descubrir entradas, leer metadatos y calcular hashes sin mezclar responsabilidades. |
 | `baseline`, `auth` | Guardar, firmar y verificar documentos confiables con claves separadas para FIM y Persist. |
+| `fim` | Coordinar acciones FIM sin mezclar su implementación con el parser de la CLI. |
 | `monitor`, `event`, `runtime` | Comparar estados, construir eventos y coordinar watcher y reconciliación. |
 | `history`, `retention` | Escribir JSON Lines y aplicar límites de edad y espacio. |
+| `history_queue` | Limitar y reintentar evidencia pendiente; detener el monitor si se agota la capacidad. |
+| `history_export` | Filtrar por fechas y generar informes privados sin mutar la evidencia de origen. |
 | `private_store` | Validar propietarios y permisos, abrir sin seguir symlinks y publicar archivos atómicamente. |
 | `persist` | Recolectar, normalizar y comparar mecanismos systemd, cron, SSH y XDG; autenticar su baseline e historial. |
 

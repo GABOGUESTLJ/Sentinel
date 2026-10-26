@@ -103,10 +103,14 @@
 mod auth;
 mod baseline;
 mod event;
+mod fim;
 mod hash_files;
 mod history;
+mod history_export;
+mod history_queue;
 mod monitor;
 mod persist;
+mod presentation;
 mod private_store;
 mod read_files;
 mod report;
@@ -114,7 +118,7 @@ mod retention;
 mod runtime;
 mod scan_files;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, builder::TypedValueParser};
 use std::{
     ffi::{OsStr, OsString},
     num::NonZeroU64,
@@ -144,6 +148,15 @@ struct Cli {
     command: Command,
 }
 
+impl Cli {
+    fn validate_actions(&self) -> Result<(), clap::Error> {
+        match &self.command {
+            Command::Fim(args) => args.export.validate_action(args.history.is_some()),
+            Command::Persist(args) => args.export.validate_action(args.action.history),
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 /// Selects the security tool executed by Sentinel.
 ///
@@ -171,6 +184,8 @@ enum Command {
 /// watcher, la baseline autenticada, la salida de consola y la retención del
 /// historial.
 struct FimArgs {
+    #[command(flatten)]
+    output: presentation::Args,
     /// Directory to scan and monitor recursively (default: current directory).
     #[arg(short = 's', long, default_value = ".", value_name = "PATH")]
     scan: PathBuf,
@@ -190,11 +205,14 @@ struct FimArgs {
     #[arg(short, long)]
     desilent: bool,
     /// Create the trusted baseline and exit; never overwrite an existing baseline.
-    #[arg(long, conflicts_with = "update_baseline")]
+    #[arg(long, conflicts_with_all = ["update_baseline", "migrate_baseline"])]
     init_baseline: bool,
     /// Explicitly accept the current state and replace an existing baseline.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "migrate_baseline")]
     update_baseline: bool,
+    /// Copy a signed legacy TMPDIR baseline to durable storage; keep the original.
+    #[arg(long)]
+    migrate_baseline: bool,
     /// Absolute path to a private 32-byte HMAC key (default: Sentinel config directory).
     #[arg(long, value_name = "FILE")]
     hmac_key: Option<PathBuf>,
@@ -212,16 +230,20 @@ struct FimArgs {
         num_args = 0..=1,
         require_equals = true,
         default_missing_value = "",
+        value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from),
         conflicts_with_all = [
             "hardscan",
             "interval",
             "silent",
             "desilent",
             "init_baseline",
-            "update_baseline"
+            "update_baseline",
+            "migrate_baseline"
         ]
     )]
     history: Option<PathBuf>,
+    #[command(flatten)]
+    export: HistoryExportArgs,
 }
 
 #[derive(clap::Args, Debug)]
@@ -290,6 +312,8 @@ impl PersistActionArgs {
 /// Estos argumentos seleccionan la raíz del sistema, el alcance de evidencia,
 /// el modo de recolección, el detalle de salida, la retención y la acción.
 struct PersistArgs {
+    #[command(flatten)]
+    output: presentation::Args,
     /// Filesystem root to audit; alternate roots use static evidence only.
     #[arg(short, long, default_value = "/", value_name = "PATH")]
     root: PathBuf,
@@ -316,6 +340,55 @@ struct PersistArgs {
     /// ejecutará.
     #[command(flatten)]
     action: PersistActionArgs,
+    #[command(flatten)]
+    export: HistoryExportArgs,
+}
+
+#[derive(clap::Args, Debug)]
+struct HistoryExportArgs {
+    /// Export retained history without pruning or modifying it; never overwrite FILE.
+    #[arg(long, requires = "history", value_name = "FILE")]
+    export: Option<PathBuf>,
+    /// Export format (default: markdown); requires --export.
+    #[arg(long, requires = "export", value_enum)]
+    format: Option<history_export::Format>,
+    /// Include events from this UTC calendar day (YYYY-MM-DD), inclusive.
+    #[arg(long, requires = "export", value_parser = history_export::parse_day)]
+    since: Option<String>,
+    /// Include events through this UTC calendar day (YYYY-MM-DD), inclusive.
+    #[arg(long, requires = "export", value_parser = history_export::parse_day)]
+    until: Option<String>,
+}
+
+impl HistoryExportArgs {
+    fn validate_action(&self, history: bool) -> Result<(), clap::Error> {
+        let modifiers = self.format.is_some() || self.since.is_some() || self.until.is_some();
+        // Clap can waive a `requires` relation when a conflicting action is
+        // present. Enforce this cross-action invariant before any filesystem I/O.
+        if (!history && (self.export.is_some() || modifiers))
+            || (self.export.is_none() && modifiers)
+        {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "History export options require --history and --export; they cannot be combined with another action",
+            ));
+        }
+        Ok(())
+    }
+
+    fn request(self) -> Result<Option<history_export::Request>, Box<dyn std::error::Error>> {
+        let Some(destination) = self.export else {
+            return Ok(None);
+        };
+        let request = history_export::Request {
+            destination,
+            format: self.format.unwrap_or(history_export::Format::Markdown),
+            since: self.since,
+            until: self.until,
+        };
+        request.validate()?;
+        Ok(Some(request))
+    }
 }
 
 #[derive(clap::Args, Debug, Clone, Copy)]
@@ -325,8 +398,8 @@ struct PersistArgs {
 ///
 /// Define los límites configurables de retención del historial.
 struct HistoryPolicyArgs {
-    /// Delete history older than this many days.
-    #[arg(long, default_value = "90", value_name = "DAYS")]
+    /// Prune history segments older than this many days; baseline and keys never expire.
+    #[arg(long, default_value = "14", value_name = "DAYS")]
     history_days: NonZeroU64,
     /// Keep at most this many MiB of history per monitored profile.
     #[arg(long, default_value = "100", value_name = "MIB")]
@@ -408,67 +481,7 @@ fn normalize_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
 /// almacenamiento privado, la clave HMAC, la baseline, el escaneo inicial o
 /// el watcher.
 fn run_fim(args: FimArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let root = args.scan.canonicalize()?;
-    if !std::fs::symlink_metadata(&root)?.is_dir() {
-        return Err(format!("Not a directory: {}", root.display()).into());
-    }
-    if let Some(filter) = args.history {
-        let filter_label =
-            (!filter.as_os_str().is_empty()).then(|| filter.to_string_lossy().into_owned());
-        let filter_hex = if filter.as_os_str().is_empty() {
-            None
-        } else {
-            Some(event::normalize_filter(&root, filter).map_err(|error| error.to_string())?)
-        };
-        let result = history::read(&root, filter_hex.as_deref(), args.history_policy.policy())?;
-        for warning in result.warnings {
-            eprintln!("History warning: {warning}");
-        }
-        report::history(&result.events, args.verbose, filter_label.as_deref());
-        return Ok(());
-    }
-    let baseline_path = baseline::location(&root)?;
-    let key_path = auth::key_path(args.hmac_key.as_deref())?;
-    if args.init_baseline || args.update_baseline {
-        if args.update_baseline {
-            // Refuse to replace corrupt, incompatible, or unsafe references implicitly.
-            baseline::load_for_update(&baseline_path, &root, &key_path)?;
-        } else if std::fs::symlink_metadata(&baseline_path).is_ok() {
-            return Err(
-                "The baseline already exists; use --update-baseline to accept changes".into(),
-            );
-        }
-        let key_path = auth::ensure_key(args.hmac_key.as_deref())?;
-        let entries = scan_files::scan(&root)?;
-        baseline::save(
-            &baseline_path,
-            &root,
-            &entries,
-            &key_path,
-            args.update_baseline,
-        )?;
-        if !args.silent {
-            println!(
-                "Baseline saved at {} ({} entries).",
-                baseline_path.display(),
-                entries.len()
-            );
-        }
-        return Ok(());
-    }
-    let trusted = baseline::load(&baseline_path, &root, &key_path)?;
-    runtime::run(
-        &root,
-        &baseline_path,
-        trusted.entries,
-        runtime::Options {
-            interval: Duration::from_secs(args.interval.get()),
-            hardscan: args.hardscan,
-            verbose: args.verbose,
-            silent: args.silent,
-            history_policy: args.history_policy.policy(),
-        },
-    )
+    fim::run(args)
 }
 
 /// Executes the selected Linux persistence operation.
@@ -498,9 +511,11 @@ fn run_persist(args: PersistArgs) -> Result<persist::RunStatus, Box<dyn std::err
         scope: args.scope,
         offline: args.offline,
         verbose: args.verbose,
+        output: args.output.options(),
         hmac_key: args.hmac_key,
         action: args.action.action(),
         history_policy: args.history_policy.policy(),
+        export: args.export.request()?,
     })
 }
 
@@ -519,7 +534,20 @@ fn run_persist(args: PersistArgs) -> Result<persist::RunStatus, Box<dyn std::err
 /// escriben en la salida de error y devuelven código `1`. Los resultados de
 /// Persist utilizan los códigos `3`, `4` y `5`.
 fn main() -> ExitCode {
-    let cli = Cli::parse_from(normalize_args(std::env::args_os()));
+    let args = normalize_args(std::env::args_os());
+    let mut command = Cli::command();
+    if std::env::var_os("NO_COLOR").is_some() || args.iter().any(|arg| arg == "--no-color") {
+        command = command.color(clap::ColorChoice::Never);
+    }
+    let matches = command.get_matches_from(args);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if let Err(error) = cli.validate_actions() {
+        error.exit();
+    }
+    let (module, output) = match &cli.command {
+        Command::Fim(args) => ("fim", args.output.options()),
+        Command::Persist(args) => ("persist", args.output.options()),
+    };
     let result = match cli.command {
         Command::Fim(args) => run_fim(args).map(|()| ExitCode::SUCCESS),
         Command::Persist(args) => run_persist(args).map(|status| match status {
@@ -532,7 +560,7 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("Error: {error}");
+            let _ = output.diagnostic(module, "error", &format!("Error: {error}"));
             ExitCode::FAILURE
         }
     }
@@ -592,6 +620,7 @@ mod tests {
     fn defaults_and_combined_output_flags_are_explicit() {
         let args = parse_fim(["sentinel", "fim"]).unwrap();
         assert_eq!(args.scan, PathBuf::from("."));
+        assert_eq!(args.history_policy.history_days.get(), 14);
         assert_eq!(args.interval.get(), 5);
         assert!(!args.verbose && !args.silent && !args.desilent && !args.hardscan);
         let args = parse_fim([
@@ -650,6 +679,63 @@ mod tests {
         assert_eq!(args.scope, persist::ScopeSelection::System);
         assert!(args.offline && args.verbose && args.action.check);
         assert_eq!(args.hmac_key, Some(PathBuf::from("/tmp/persist-key")));
-        assert_eq!(args.history_policy.history_days.get(), 90);
+        assert_eq!(args.history_policy.history_days.get(), 14);
+    }
+
+    #[test]
+    fn parses_explicit_migration_and_history_export_actions() {
+        assert!(parse_fim(["sentinel", "fim", "--migrate-baseline"]).is_ok());
+        for tool in ["fim", "persist"] {
+            assert!(
+                Cli::try_parse_from([
+                    "sentinel",
+                    tool,
+                    "--history",
+                    "--export",
+                    "/exports/audit.md",
+                    "--format",
+                    "markdown",
+                    "--since",
+                    "2026-01-01",
+                    "--until",
+                    "2026-01-31",
+                ])
+                .is_ok()
+            );
+            assert!(
+                Cli::try_parse_from(["sentinel", tool, "--export", "/exports/audit.txt",]).is_err()
+            );
+            assert!(
+                Cli::try_parse_from(["sentinel", tool, "--history", "--format", "text",]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn validates_export_action_invariants_after_clap_conflict_resolution() {
+        for (tool, action) in [
+            ("fim", "--init-baseline"),
+            ("fim", "--update-baseline"),
+            ("fim", "--migrate-baseline"),
+            ("persist", "--list"),
+            ("persist", "--init-baseline"),
+            ("persist", "--update-baseline"),
+            ("persist", "--check"),
+        ] {
+            let result = Cli::try_parse_from([
+                "sentinel",
+                tool,
+                action,
+                "--export",
+                "/exports/audit.txt",
+                "--format",
+                "text",
+            ])
+            .and_then(|cli| cli.validate_actions());
+            assert!(
+                result.is_err(),
+                "{tool} {action} must not ignore export options"
+            );
+        }
     }
 }

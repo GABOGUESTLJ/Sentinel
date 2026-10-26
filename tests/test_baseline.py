@@ -19,19 +19,22 @@ class BaselineTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.root = self.base / "watched"
         self.root.mkdir()
-        self.state = self.base / "temp-store"
-        self.state.mkdir()
+        self.state = self.base / "durable-state"
+        self.state.mkdir(mode=0o700)
+        self.legacy_temp = self.base / "temp-store"
+        self.legacy_temp.mkdir()
         self.env = dict(
             os.environ,
-            TMPDIR=str(self.state),
+            TMPDIR=str(self.legacy_temp),
+            SENTINEL_STATE_DIR=str(self.state),
             XDG_STATE_HOME=str(self.base / "xdg-state"),
             XDG_CONFIG_HOME=str(self.base / "xdg-config"),
         )
         key = hashlib.sha256(os.fsencode(self.root.resolve())).hexdigest()
-        self.baseline = self.state / f"fim-baselines-{os.geteuid()}" / f"{key}.json"
+        self.baseline = self.state / "fim" / "baselines" / f"{key}.json"
 
     def run_cli(self, *args, success=True, env=None):
-        result = subprocess.run([str(BINARY), "fim", "-s", str(self.root), *args],
+        result = subprocess.run([str(BINARY), "fim", "--output", "legacy", "-s", str(self.root), *args],
                                 env=self.env if env is None else env,
                                 capture_output=True, text=True, timeout=5)
         if success:
@@ -101,7 +104,7 @@ class BaselineTests(unittest.TestCase):
         self.run_cli("--init-baseline", "--update-baseline", success=False)
         self.assertFalse(self.baseline.exists())
 
-    def test_deleted_temporary_baseline_requires_new_explicit_creation(self):
+    def test_deleted_baseline_requires_new_explicit_creation(self):
         result = self.run_cli("--init-baseline", "--silent")
         self.assertEqual(result.stdout, "")
         self.baseline.unlink()
@@ -194,12 +197,13 @@ class BaselineTests(unittest.TestCase):
     def test_storage_symlink_is_rejected(self):
         target = self.state / "other"
         target.mkdir(mode=0o700)
+        self.baseline.parent.parent.mkdir(mode=0o700)
         self.baseline.parent.symlink_to(target, target_is_directory=True)
         self.run_cli("--init-baseline", success=False)
         self.assertEqual(list(target.iterdir()), [])
 
-    def test_temp_inside_watched_tree_rejected(self):
-        env = dict(self.env, TMPDIR=str(self.root))
+    def test_state_inside_watched_tree_rejected(self):
+        env = dict(self.env, SENTINEL_STATE_DIR=str(self.root))
         result = self.run_cli("--init-baseline", success=False, env=env)
         self.assertIn("inside the monitored tree", result.stderr)
         self.assertEqual(list(self.root.iterdir()), [])

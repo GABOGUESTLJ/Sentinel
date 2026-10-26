@@ -1,7 +1,10 @@
 [package]
 name = "sentinel"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+description = "Linux security CLI for file integrity monitoring and persistence auditing"
+repository = "https://github.com/GABOGUESTLJ/Sentinel"
+readme = "README.md"
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
@@ -16,3 +19,5 @@ libc = "0.2.189"
 notify = "8.2.0"
 zbus = "5.19.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
+unicode-width = "0.2.1"
+terminal_size = "0.4.2"

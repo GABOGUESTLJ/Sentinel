@@ -23,7 +23,8 @@ class PersistTests(unittest.TestCase):
         self.state.mkdir()
         self.fim_temp.mkdir()
         self.env = dict(os.environ, XDG_STATE_HOME=str(self.state),
-                        XDG_CONFIG_HOME=str(self.base / "config"), TMPDIR=str(self.fim_temp))
+                        XDG_CONFIG_HOME=str(self.base / "config"), TMPDIR=str(self.fim_temp),
+                        SENTINEL_STATE_DIR=str(self.base / "fim-state"))
         self.service = self.root / "etc/systemd/system/demo.service"
         self.service.parent.mkdir(parents=True)
         self.service.write_text("[Service]\nExecStart=/usr/bin/trusted-agent\n")
@@ -48,7 +49,7 @@ class PersistTests(unittest.TestCase):
 
     def run_persist(self, *args, success=True, expected_code=None):
         result = subprocess.run(
-            [str(BINARY), "persist", "--root", str(self.root), "--offline", *args],
+            [str(BINARY), "persist", "--output", "legacy", "--root", str(self.root), "--offline", *args],
             env=self.env,
             capture_output=True,
             text=True,

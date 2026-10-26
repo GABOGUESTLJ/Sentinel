@@ -74,7 +74,9 @@ fn collect_directory(
     scope: Scope,
     owner: &str,
 ) -> Result<(), String> {
-    for path in regular_files(directory)? {
+    let files = regular_files(directory)?;
+    output.inspected(Source::Xdg, scope, owner, directory);
+    for path in files {
         if path
             .extension()
             .is_none_or(|extension| extension != "desktop")
@@ -105,8 +107,9 @@ pub fn collect(options: &Options) -> CollectorOutput {
     }
     if options.scope.includes_user() {
         output.covered(Source::Xdg, Scope::User);
-        for (owner, home) in user_homes(&options.root) {
+        for (owner, home) in user_homes(&options.root, &mut output, Source::Xdg) {
             if owner == "root" {
+                output.warnings.push("COVERAGE source=xdg scope=user owner=\"root\" status=skipped reason=existing-collector-boundary".into());
                 continue;
             }
             if let Err(error) = collect_directory(

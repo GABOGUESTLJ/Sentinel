@@ -1,5 +1,5 @@
 use crate::{
-    event::{self, AuditEvent, BuildContext, Origin},
+    event::{self, BuildContext, Origin},
     history, report,
     scan_files::Entries,
 };
@@ -24,6 +24,7 @@ pub struct Options {
     pub verbose: bool,
     pub silent: bool,
     pub history_policy: crate::retention::Policy,
+    pub output: crate::presentation::Options,
 }
 
 enum Message {
@@ -31,7 +32,7 @@ enum Message {
     Event(notify::Result<Event>),
 }
 
-fn commands(sender: SyncSender<Message>) {
+fn commands(sender: SyncSender<Message>, output: crate::presentation::Options) {
     thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             match line {
@@ -41,7 +42,11 @@ fn commands(sender: SyncSender<Message>) {
                     }
                 }
                 Err(error) => {
-                    eprintln!("Failed to read commands; monitoring continues: {error}");
+                    let _ = output.diagnostic(
+                        "fim",
+                        "error",
+                        &format!("Failed to read commands; monitoring continues: {error}"),
+                    );
                     break;
                 }
             }
@@ -83,37 +88,40 @@ fn start_watcher(
     }
 }
 
-fn apply_command(line: &str, silent: &mut bool) {
+fn apply_command(
+    line: &str,
+    silent: &mut bool,
+    output: &crate::presentation::Options,
+) -> io::Result<()> {
     match line.trim() {
         "--silent" => {
             *silent = true;
-            println!("Output silenced. Enter -d or --desilent to enable it.");
+            output.message(
+                "fim",
+                "status",
+                "Output silenced. Enter -d or --desilent to enable it.",
+                "Output silenced. Enter -d or --desilent to enable it.",
+                &serde_json::json!({"silent":true}),
+            )?;
         }
         "-d" | "--desilent" => {
             *silent = false;
-            println!("Output enabled.");
+            output.message(
+                "fim",
+                "status",
+                "Output enabled.",
+                "Output enabled.",
+                &serde_json::json!({"silent":false}),
+            )?;
         }
         "" => {}
-        _ => eprintln!("Unknown command. Enter --silent or -d/--desilent."),
+        _ => output.diagnostic(
+            "fim",
+            "warning",
+            "Unknown command. Enter --silent or -d/--desilent.",
+        )?,
     }
-}
-
-fn persist_history(
-    writer: &mut history::Writer,
-    pending: &mut Vec<AuditEvent>,
-    events: &[AuditEvent],
-) {
-    pending.extend_from_slice(events);
-    if pending.is_empty() {
-        return;
-    }
-    match writer.append(pending) {
-        Ok(()) => pending.clear(),
-        Err(error) => eprintln!(
-            "History write failed; monitoring continues and will retry {} pending event(s): {error}",
-            pending.len()
-        ),
-    }
+    Ok(())
 }
 
 pub fn run(
@@ -128,7 +136,8 @@ pub fn run(
     let mut previous = crate::scan_files::scan(root)?;
     let mut history = history::Writer::open(root, options.history_policy)?;
     let mut sequence = 0;
-    let mut pending_history = Vec::new();
+    let mut pending_history =
+        crate::history_queue::HistoryQueue::with_output(options.output.clone());
     let startup_events = {
         let mut context = BuildContext {
             root_hex: history.root_hex(),
@@ -138,19 +147,38 @@ pub fn run(
         };
         event::build(&trusted, &previous, &trusted, &mut context)
     };
-    persist_history(&mut history, &mut pending_history, &startup_events);
+    pending_history.record(&startup_events, |events| history.append(events))?;
     let mut silent = options.silent;
     if !silent {
         report::initial(
+            &mut io::stdout().lock(),
+            &options.output,
             root,
             baseline_path,
             history.path(),
             &previous,
             options.hardscan,
-        );
-        report::live_events(&startup_events, options.verbose);
+            options.verbose,
+        )?;
+        if startup_events.is_empty() && options.output.mode != crate::presentation::Mode::Legacy {
+            report::events(
+                &mut io::stdout().lock(),
+                &options.output,
+                &startup_events,
+                options.verbose,
+                None,
+                false,
+            )?;
+        } else {
+            report::live_events(
+                &mut io::stdout().lock(),
+                &options.output,
+                &startup_events,
+                options.verbose,
+            )?;
+        }
     }
-    commands(sender);
+    commands(sender, options.output.clone());
     let mut last_scan = Instant::now();
     let mut pending_event: Option<Instant> = None;
     let mut event_count = 0usize;
@@ -161,7 +189,11 @@ pub fn run(
         let event_due = pending_event.is_some_and(|deadline| now >= deadline);
         if overflowed || periodic_due || event_due {
             if overflowed {
-                eprintln!("Watcher event queue overflowed; reconciling the full tree");
+                options.output.diagnostic(
+                    "fim",
+                    "warning",
+                    "Watcher event queue overflowed; reconciling the full tree",
+                )?;
             }
             match crate::scan_files::scan(root) {
                 Ok(current) => {
@@ -174,18 +206,34 @@ pub fn run(
                         };
                         event::build(&previous, &current, &trusted, &mut context)
                     };
-                    persist_history(&mut history, &mut pending_history, &audit_events);
+                    pending_history.record(&audit_events, |events| history.append(events))?;
                     if !silent {
-                        report::live_events(&audit_events, options.verbose);
+                        report::live_events(
+                            &mut io::stdout().lock(),
+                            &options.output,
+                            &audit_events,
+                            options.verbose,
+                        )?;
                         if audit_events.is_empty() && event_count > 0 && !options.hardscan {
-                            println!(
+                            let message = format!(
                                 "ACTIVITY {event_count} filesystem event(s); no state difference at reconciliation"
                             );
+                            options.output.message(
+                                "fim",
+                                "activity",
+                                &message,
+                                &message,
+                                &serde_json::json!({"filesystem_events":event_count,"changes":0}),
+                            )?;
                         }
                     }
                     previous = current;
                 }
-                Err(error) => eprintln!("Incomplete scan; keeping the previous state: {error}"),
+                Err(error) => options.output.diagnostic(
+                    "fim",
+                    "error",
+                    &format!("Incomplete scan; keeping the previous state: {error}"),
+                )?,
             }
             // Every mode gets another complete FIM scan after the interval,
             // including when the last scan failed and PollWatcher goes quiet.
@@ -204,7 +252,7 @@ pub fn run(
             timeout = timeout.min(deadline.saturating_duration_since(now));
         }
         match receiver.recv_timeout(timeout) {
-            Ok(Message::Command(line)) => apply_command(&line, &mut silent),
+            Ok(Message::Command(line)) => apply_command(&line, &mut silent, &options.output)?,
             Ok(Message::Event(Ok(event))) => {
                 let needs_rescan = event.need_rescan();
                 // Reading files for reconciliation can itself produce access events.
@@ -221,7 +269,11 @@ pub fn run(
                 pending_event = Some(pending_event.map_or(deadline, |old| old.min(deadline)));
             }
             Ok(Message::Event(Err(error))) => {
-                eprintln!("Watcher error; reconciling: {error}");
+                options.output.diagnostic(
+                    "fim",
+                    "error",
+                    &format!("Watcher error; reconciling: {error}"),
+                )?;
                 pending_event = Some(Instant::now());
             }
             Err(RecvTimeoutError::Timeout) => {}

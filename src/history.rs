@@ -9,7 +9,7 @@ use std::{
 
 type Error = Box<dyn std::error::Error>;
 
-fn directory(root: &Path) -> Result<PathBuf, Error> {
+pub fn directory(root: &Path) -> Result<PathBuf, Error> {
     let root_key = hex::encode(crate::hash_files::hash_bytes(root.as_os_str().as_bytes()));
     let directory = crate::private_store::state_home()?
         .join("sentinel")
@@ -124,15 +124,30 @@ pub fn read(
     path_filter_hex: Option<&str>,
     policy: crate::retention::Policy,
 ) -> Result<ReadResult, Error> {
+    read_with_policy(root, path_filter_hex, Some(policy))
+}
+
+/// Inspect available records without pruning, creating storage, or repairing it.
+pub fn read_only(root: &Path, path_filter_hex: Option<&str>) -> Result<ReadResult, Error> {
+    read_with_policy(root, path_filter_hex, None)
+}
+
+fn read_with_policy(
+    root: &Path,
+    path_filter_hex: Option<&str>,
+    policy: Option<crate::retention::Policy>,
+) -> Result<ReadResult, Error> {
     let directory = directory(root)?;
-    if !directory.exists() {
+    if !directory.try_exists()? {
         return Ok(ReadResult {
             events: Vec::new(),
             warnings: Vec::new(),
         });
     }
     crate::private_store::ensure_private_directory(&directory, false, "history")?;
-    crate::retention::prune_jsonl(&directory, policy, None)?;
+    if let Some(policy) = policy {
+        crate::retention::prune_jsonl(&directory, policy, None)?;
+    }
     let expected_root = hex::encode(root.as_os_str().as_bytes());
     let mut files = Vec::new();
     for item in fs::read_dir(&directory)? {

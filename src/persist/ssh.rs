@@ -1,5 +1,5 @@
 use super::{
-    collect::{Options, display_origin, read_text, rooted, user_homes},
+    collect::{Options, display_origin, path_exists, read_text, rooted, user_homes},
     model::{CollectorOutput, EntrySpec, Evidence, PersistenceEntry, Scope, Source},
 };
 use crate::hash_files;
@@ -66,7 +66,9 @@ fn collect_home(
     scope: Scope,
 ) -> Result<(), String> {
     let path = home.join(".ssh/authorized_keys");
-    if !path.exists() {
+    let exists = path_exists(&path)?;
+    output.inspected(Source::Ssh, scope, owner, &path);
+    if !exists {
         return Ok(());
     }
     let text = read_text(&path)?;
@@ -95,8 +97,9 @@ pub fn collect(options: &Options) -> CollectorOutput {
     }
     if options.scope.includes_user() {
         output.covered(Source::Ssh, Scope::User);
-        for (owner, home) in user_homes(&options.root) {
+        for (owner, home) in user_homes(&options.root, &mut output, Source::Ssh) {
             if owner == "root" {
+                output.warnings.push("COVERAGE source=ssh scope=user owner=\"root\" status=skipped reason=system-scope-only".into());
                 continue;
             }
             if let Err(error) = collect_home(&mut output, &options.root, &home, &owner, Scope::User)

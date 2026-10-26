@@ -53,14 +53,109 @@ pub struct Baseline {
 }
 
 pub fn location(root: &Path) -> Result<PathBuf, Error> {
-    let temp = std::env::temp_dir().canonicalize()?;
-    let directory = temp.join(format!("fim-baselines-{}", private_store::uid()));
-    if directory.starts_with(root) {
-        return Err("The temporary baseline directory is inside the monitored tree; set TMPDIR to an external temporary directory".into());
+    let root = root.canonicalize()?;
+    let override_path = std::env::var_os("SENTINEL_STATE_DIR");
+    let state = override_path
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/var/lib/sentinel").join(private_store::uid().to_string())
+        });
+    if !state.is_absolute()
+        || state
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err("SENTINEL_STATE_DIR must be an absolute path without '..' components".into());
     }
-    private_store::ensure_private_directory(&directory, false, "baseline")?;
+    let directory = state.join("fim/baselines");
+    if directory.starts_with(&root) {
+        return Err(format!(
+            "The baseline directory {} is inside the monitored tree; set SENTINEL_STATE_DIR to an external private state directory",
+            directory.display()
+        ).into());
+    }
+    // Check all ancestors before creation: recursive create_dir would otherwise
+    // follow an existing symlink, including above the private state root.
+    reject_symlink_components(&directory)?;
+    if override_path.is_none() && !state.try_exists()? {
+        return Err(format!(
+            "Baseline state directory {} is not provisioned; ask an administrator to create it private and owned by uid {}, or set SENTINEL_STATE_DIR to an absolute writable private directory",
+            state.display(), private_store::uid()
+        ).into());
+    }
+    let prepare = || -> Result<(), Error> {
+        if override_path.is_some() {
+            let mut ancestor = PathBuf::new();
+            for component in state.components() {
+                ancestor.push(component.as_os_str());
+                if !ancestor.try_exists()? {
+                    private_store::ensure_private_directory(&ancestor, false, "baseline state")?;
+                }
+            }
+        }
+        private_store::ensure_private_directory(&state, false, "baseline state")?;
+        private_store::ensure_private_directory(&state.join("fim"), false, "baseline")?;
+        private_store::ensure_private_directory(&directory, false, "baseline")
+    };
+    prepare().map_err(|error| format!(
+        "Could not prepare baseline state {}: {error}. Provision a private writable directory owned by uid {}, or set SENTINEL_STATE_DIR; temporary storage is not used as a fallback",
+        state.display(), private_store::uid()
+    ))?;
+    Ok(directory.join(baseline_name(&root)))
+}
+
+fn baseline_name(root: &Path) -> String {
     let key = hex::encode(hash_files::hash_bytes(root.as_os_str().as_bytes()));
-    Ok(directory.join(format!("{key}.json")))
+    format!("{key}.json")
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), Error> {
+    let mut ancestor = PathBuf::new();
+    for component in path.components() {
+        ancestor.push(component.as_os_str());
+        match std::fs::symlink_metadata(&ancestor) {
+            Ok(metadata) if !metadata.is_dir() => return Err(format!(
+                "Unsafe baseline directory component {}: expected a directory, not a symlink or file",
+                ancestor.display()
+            ).into()),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Locate legacy storage without creating it or changing its permissions.
+pub fn legacy_location(root: &Path) -> Result<PathBuf, Error> {
+    let temp = std::env::temp_dir();
+    reject_symlink_components(&temp)?;
+    Ok(temp
+        .canonicalize()?
+        .join(format!("fim-baselines-{}", private_store::uid()))
+        .join(baseline_name(&root.canonicalize()?)))
+}
+
+/// Authenticate a single read, then publish those exact bytes without replacement.
+pub fn migrate(root: &Path, key_path: &Path) -> Result<PathBuf, Error> {
+    use std::os::unix::fs::MetadataExt;
+    let root = root.canonicalize()?;
+    let source = legacy_location(&root)?;
+    let directory = source.parent().ok_or("Legacy baseline has no parent")?;
+    reject_symlink_components(directory)?;
+    // ensure_private_directory creates missing paths, so it cannot be used for
+    // this strictly read-only legacy directory validation.
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.uid() != private_store::uid() || metadata.mode() & 0o077 != 0
+    {
+        return Err("Unsafe legacy baseline directory: expected a private directory owned by the current user".into());
+    }
+    let bytes = read_bytes(&source)?;
+    load_bytes(&bytes, &root, key_path)?;
+    let destination = location(&root)?;
+    private_store::atomic_write(&destination, &bytes, false)?;
+    Ok(destination)
 }
 
 fn read_bytes(path: &Path) -> Result<Vec<u8>, Error> {
@@ -142,7 +237,11 @@ fn validate(document: Document, root: &Path) -> Result<Baseline, Error> {
 
 pub fn load(path: &Path, root: &Path, key_path: &Path) -> Result<Baseline, Error> {
     let bytes = read_bytes(path)?;
-    let envelope: AuthenticatedDocument = serde_json::from_slice(&bytes).map_err(|error| {
+    load_bytes(&bytes, root, key_path)
+}
+
+fn load_bytes(bytes: &[u8], root: &Path, key_path: &Path) -> Result<Baseline, Error> {
+    let envelope: AuthenticatedDocument = serde_json::from_slice(bytes).map_err(|error| {
         format!(
             "Baseline is unsigned, corrupt, or incompatible ({error}); use --update-baseline to migrate a valid legacy baseline"
         )
@@ -332,5 +431,263 @@ mod tests {
         value["payload"]["root_hex"] = "00".into();
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(load_for_update(&path, &root, &key).is_err());
+    }
+
+    // Environment-dependent APIs run in a child so parallel tests never mutate
+    // the process-wide environment or access the default system destination.
+    #[test]
+    fn durable_storage_contract() {
+        let temp = Temp::new();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "baseline::tests::durable_storage_child",
+                "--nocapture",
+            ])
+            .env("BASELINE_CONTRACT_CHILD", "1")
+            .env("TMPDIR", &temp.0)
+            .env("SENTINEL_STATE_DIR", temp.0.join("state"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "baseline::tests::default_location_child",
+                "--nocapture",
+            ])
+            .env("BASELINE_CONTRACT_CHILD", "1")
+            .env_remove("SENTINEL_STATE_DIR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let watched = temp.0.join("watched");
+        fs::create_dir(&watched).unwrap();
+        let linked = temp.0.join("linked");
+        std::os::unix::fs::symlink(&watched, &linked).unwrap();
+        for (state, expected_error) in [
+            (PathBuf::from("relative-state"), "must be an absolute path"),
+            (watched.join("new/state"), "inside the monitored tree"),
+            (linked.join("state"), "not a symlink"),
+        ] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "baseline::tests::location_rejection_child",
+                    "--nocapture",
+                ])
+                .env("BASELINE_CONTRACT_CHILD", "1")
+                .env("BASELINE_TEST_ROOT", &watched)
+                .env("BASELINE_EXPECTED_ERROR", expected_error)
+                .env("SENTINEL_STATE_DIR", state)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(fs::read_dir(&watched).unwrap().count(), 0);
+        }
+        if private_store::uid() != 0 {
+            let locked = temp.0.join("locked");
+            fs::create_dir(&locked).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "baseline::tests::location_rejection_child",
+                    "--nocapture",
+                ])
+                .env("BASELINE_CONTRACT_CHILD", "1")
+                .env("BASELINE_TEST_ROOT", &watched)
+                .env(
+                    "BASELINE_EXPECTED_ERROR",
+                    "Provision a private writable directory",
+                )
+                .env("SENTINEL_STATE_DIR", &locked)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_eq!(
+                fs::metadata(&locked).unwrap().permissions().mode() & 0o777,
+                0o500
+            );
+            assert_eq!(fs::read_dir(&locked).unwrap().count(), 0);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    #[test]
+    fn location_rejection_child() {
+        if std::env::var_os("BASELINE_CONTRACT_CHILD").is_none() {
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("BASELINE_TEST_ROOT").unwrap());
+        let expected = std::env::var("BASELINE_EXPECTED_ERROR").unwrap();
+        let error = location(&root).unwrap_err().to_string();
+        assert!(error.contains(&expected), "{error}");
+    }
+
+    #[test]
+    fn default_location_child() {
+        if std::env::var_os("BASELINE_CONTRACT_CHILD").is_none() {
+            return;
+        }
+        // Root covers every possible destination: rejection must precede writes.
+        let error = location(Path::new("/")).unwrap_err().to_string();
+        assert!(error.contains("inside the monitored tree"), "{error}");
+        assert!(
+            error.contains(&format!("/var/lib/sentinel/{}", private_store::uid())),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn durable_storage_child() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        if std::env::var_os("BASELINE_CONTRACT_CHILD").is_none() {
+            return;
+        }
+        let temp = Temp::new();
+        let root = temp.0.join("watched");
+        fs::create_dir(&root).unwrap();
+        let state = PathBuf::from(std::env::var_os("SENTINEL_STATE_DIR").unwrap());
+        let digest = hex::encode(hash_files::hash_bytes(root.as_os_str().as_bytes()));
+        let expected = state.join("fim/baselines").join(format!("{digest}.json"));
+        let source = legacy_location(&root).unwrap();
+        assert!(!source.parent().unwrap().exists());
+        assert_eq!(
+            source,
+            std::env::temp_dir()
+                .join(format!("fim-baselines-{}", private_store::uid()))
+                .join(format!("{digest}.json"))
+        );
+        assert!(!state.exists());
+        let absent_key = temp.0.join("not-created-key");
+        assert!(migrate(&root, &absent_key).is_err());
+        assert!(!source.parent().unwrap().exists());
+        assert!(!state.exists());
+        assert!(!absent_key.exists());
+
+        let destination = location(&root).unwrap();
+        assert_eq!(destination, expected);
+        for directory in [&state, &state.join("fim"), destination.parent().unwrap()] {
+            let metadata = fs::symlink_metadata(directory).unwrap();
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+            assert_eq!(metadata.uid(), private_store::uid());
+        }
+        assert_eq!(location(&root.join(".")).unwrap(), destination);
+        assert!(location(temp.0.parent().unwrap()).is_err());
+
+        private_store::ensure_private_directory(source.parent().unwrap(), false, "test").unwrap();
+        let key = temp.key(11);
+        let key_bytes = fs::read(&key).unwrap();
+        let entries = Entries::from([(PathBuf::from("trusted"), file(7))]);
+        save(&source, &root, &entries, &key, false).unwrap();
+        // Valid noncanonical JSON whitespace must survive migration exactly.
+        let mut original = fs::read(&source).unwrap();
+        original.extend_from_slice(b" \n\t");
+        fs::write(&source, &original).unwrap();
+        fs::write(root.join("trusted"), b"untrusted current content").unwrap();
+        assert_eq!(migrate(&root, &key).unwrap(), destination);
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&key).unwrap(), key_bytes);
+        assert_eq!(load(&destination, &root, &key).unwrap().entries, entries);
+        let metadata = fs::metadata(&destination).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), private_store::uid());
+        assert_eq!(metadata.nlink(), 1);
+        assert!(migrate(&root, &key).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&key).unwrap(), key_bytes);
+        fs::set_permissions(source.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(migrate(&root, &key).is_err());
+        assert_eq!(fs::read(&source).unwrap(), original);
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        assert_eq!(fs::read(&key).unwrap(), key_bytes);
+        fs::set_permissions(source.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        for variant in [
+            "tamper",
+            "wrong-root",
+            "unsigned",
+            "wrong-key",
+            "missing-key",
+            "public",
+            "symlink",
+        ] {
+            let other = temp.0.join(variant);
+            fs::create_dir(&other).unwrap();
+            let legacy = legacy_location(&other).unwrap();
+            let target = location(&other).unwrap();
+            let signing_root = if variant == "wrong-root" {
+                &root
+            } else {
+                &other
+            };
+            save(&legacy, signing_root, &entries, &key, false).unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&fs::read(&legacy).unwrap()).unwrap();
+            match variant {
+                "tamper" => {
+                    value["payload"]["created_at"] = "changed".into();
+                    fs::write(&legacy, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "unsigned" => {
+                    value["payload"]["version"] = 2.into();
+                    fs::write(&legacy, serde_json::to_vec(&value["payload"]).unwrap()).unwrap();
+                }
+                "public" => {
+                    fs::set_permissions(&legacy, fs::Permissions::from_mode(0o644)).unwrap()
+                }
+                "symlink" => {
+                    let moved = temp.0.join("linked-source");
+                    fs::rename(&legacy, &moved).unwrap();
+                    symlink(moved, &legacy).unwrap();
+                }
+                _ => {}
+            }
+            let supplied_key = match variant {
+                "wrong-key" => temp.key(12),
+                "missing-key" => temp.0.join("absent-key"),
+                _ => key.clone(),
+            };
+            let before = fs::read(&legacy).unwrap();
+            let directory_before = fs::read_dir(target.parent().unwrap()).unwrap().count();
+            assert!(migrate(&other, &supplied_key).is_err(), "{variant}");
+            assert!(!target.exists(), "{variant}");
+            assert_eq!(fs::read(&legacy).unwrap(), before, "{variant}");
+            assert_eq!(fs::read(&key).unwrap(), key_bytes, "{variant}");
+            assert_eq!(
+                fs::read_dir(target.parent().unwrap()).unwrap().count(),
+                directory_before
+            );
+            if variant == "missing-key" {
+                assert!(!supplied_key.exists());
+            }
+        }
+
+        // Unsafe existing state is rejected without changing its permissions.
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(location(&root).is_err());
+        assert_eq!(fs::metadata(&state).unwrap().mode() & 0o777, 0o755);
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::rename(state.join("fim"), state.join("real-fim")).unwrap();
+        symlink(state.join("real-fim"), state.join("fim")).unwrap();
+        assert!(location(&root).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), original);
     }
 }
